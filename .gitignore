@@ -14,3 +14,6 @@ __pycache__/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# poisoned pre-rebuild file, kept locally for reference only
+*_BACKUP.blend

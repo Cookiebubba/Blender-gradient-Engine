@@ -4463,15 +4463,52 @@ CLASSES = (
 )
 
 
-@bpy.app.handlers.persistent
+_pending_pattern_size = [None]
+
+
+def _rebuild_patterns_deferred():
+    """Resize the baked tiles, off the depsgraph.
+
+    Deliberately NOT done inside the depsgraph handler. build_patterns frees
+    and reallocates image datablocks, and doing that while the depsgraph is
+    evaluating - with the viewport reading those same buffers - is a
+    use-after-free. It surfaces as an access violation inside tbbmalloc with
+    no Python frames, which is a miserable thing to diagnose. A timer runs
+    once evaluation has finished, where the swap is safe.
+    """
+    want = _pending_pattern_size[0]
+    _pending_pattern_size[0] = None
+    if want is None:
+        return None
+    w, h = want
+    try:
+        scene = bpy.context.scene
+        p = scene.wavetex
+        if scene.render.resolution_x != w or scene.render.resolution_y != h:
+            return None                     # changed again; a later tick owns it
+        with viewport_paused(bpy.context):
+            build_patterns(w, h, p.seed,
+                       scrim=(p.scrim_dir, p.scrim_coverage, p.scrim_softness),
+                       edge=(p.edge_inset, p.edge_softness),
+                       grain=dict(size=p.grain_size, roughness=p.grain_roughness,
+                                  scale=p.grain_scale, chroma=p.grain_chroma),
+                           dither=dict(mode=p.dither_mode, cell=p.dither_cell,
+                                       order=p.dither_order, angle=p.dither_angle,
+                                       rgb_split=p.dither_rgb_split))
+            sync_fx(bpy.context)
+    except Exception as exc:
+        print("[wave_texture_maker] pattern resize skipped:", exc)
+    return None
+
+
 @bpy.app.handlers.persistent
 def _on_depsgraph(scene, _depsgraph=None):
-    """Keep the baked patterns the same size as the render.
+    """Notice a resolution change and queue a tile rebuild.
 
     Compositor Image nodes do not stretch to fit the frame - they sit at their
-    own pixel size. Change the resolution in the Output panel and the grain,
-    dither and scrim would cover only part of the frame as a hard-edged
-    rectangle, which is exactly the kind of thing you only notice at export.
+    own pixel size - so the tiles have to track the output resolution or the
+    grain and dither cover only part of the frame. This handler only records
+    that a resize is needed; the work happens on a timer.
     """
     try:
         p = scene.wavetex
@@ -4485,43 +4522,56 @@ def _on_depsgraph(scene, _depsgraph=None):
         return
     if tuple(ref.size) == (r.resolution_x, r.resolution_y):
         return
-    build_patterns(r.resolution_x, r.resolution_y, p.seed,
-                   scrim=(p.scrim_dir, p.scrim_coverage, p.scrim_softness),
-                   edge=(p.edge_inset, p.edge_softness),
-                   grain=dict(size=p.grain_size, roughness=p.grain_roughness,
-                              scale=p.grain_scale, chroma=p.grain_chroma),
-                   dither=dict(mode=p.dither_mode, cell=p.dither_cell, order=p.dither_order,
-                               angle=p.dither_angle, rgb_split=p.dither_rgb_split))
-    sync_fx(bpy.context)
+    _pending_pattern_size[0] = (r.resolution_x, r.resolution_y)
+    if not bpy.app.timers.is_registered(_rebuild_patterns_deferred):
+        bpy.app.timers.register(_rebuild_patterns_deferred, first_interval=0.1)
 
 
-def _on_load(_dummy):
-    """Blender stores generated images by their settings, not their pixels, so
-    the dither/grain patterns come back blank (or missing) after a reload.
-    Regenerate them - they are deterministic, so the look is unchanged."""
-    ctx = bpy.context
-    sc = ctx.scene
+@bpy.app.handlers.persistent
+def _restore_after_load():
+    """Rebuild generated data for a freshly opened file.
+
+    Two things make this dangerous and both are handled here. It runs on a
+    timer rather than inside load_post, because Blender is still finalising the
+    file when that fires. And it holds the viewport at solid shading while it
+    works, because a newly opened file comes up already shading the images this
+    frees and reallocates - doing that underneath a live viewport corrupts the
+    heap and kills the process with STATUS_HEAP_CORRUPTION.
+    """
     try:
-        if sc.use_nodes and sc.node_tree and 'DitherPattern' in sc.node_tree.nodes:
-            build_patterns(sc.render.resolution_x, sc.render.resolution_y)
-            sync_fx(ctx)
-        # pipeline B images are file-backed and do survive, but the nodes still
-        # need re-pointing at the reloaded datablocks
-        if bpy.data.materials.get(IRI_MAT):
-            d = sim_dir()
-            for nm, fn in (("WT_FilmLUT", "film_lut.exr"), ("WT_SimHeight", "height_0001.exr")):
-                if bpy.data.images.get(nm) is None:
-                    path = os.path.join(d, fn)
-                    if os.path.exists(path):
-                        img = bpy.data.images.load(path)
-                        img.name = nm
-                        img.colorspace_settings.name = 'Non-Color'
-                        if nm == "WT_SimHeight":
-                            img.source = 'SEQUENCE'
-            sync_iri(ctx)
-        library_refresh(sc)
+        ctx = bpy.context
+        sc = ctx.scene
+        with viewport_paused(ctx):
+            if sc.use_nodes and sc.node_tree and 'DitherPattern' in sc.node_tree.nodes:
+                # generated images store their settings, not their pixels, so the
+                # tiles come back blank after a reload - they are deterministic,
+                # so regenerating changes nothing about the look
+                build_patterns(sc.render.resolution_x, sc.render.resolution_y)
+                sync_fx(ctx)
+            if bpy.data.materials.get(IRI_MAT):
+                d = sim_dir()
+                for nm, fn in (("WT_FilmLUT", "film_lut.exr"),
+                               ("WT_SimHeight", "height_0001.exr")):
+                    if bpy.data.images.get(nm) is None:
+                        path = os.path.join(d, fn)
+                        if os.path.exists(path):
+                            img = bpy.data.images.load(path)
+                            img.name = nm
+                            img.colorspace_settings.name = 'Non-Color'
+                            if nm == "WT_SimHeight":
+                                img.source = 'SEQUENCE'
+                sync_iri(ctx)
+            library_refresh(sc)
     except Exception as exc:      # never block opening a file
         print("[wave_texture_maker] restore skipped:", exc)
+    return None
+
+
+@bpy.app.handlers.persistent
+def _on_load(_dummy):
+    """Queue the restore. Does no work itself - see _restore_after_load."""
+    if not bpy.app.timers.is_registered(_restore_after_load):
+        bpy.app.timers.register(_restore_after_load, first_interval=0.3)
 
 
 def _deferred_library_refresh():
@@ -4556,8 +4606,10 @@ def register():
 
 
 def unregister():
-    if bpy.app.timers.is_registered(_deferred_library_refresh):
-        bpy.app.timers.unregister(_deferred_library_refresh)
+    for _t in (_deferred_library_refresh, _rebuild_patterns_deferred,
+               _restore_after_load):
+        if bpy.app.timers.is_registered(_t):
+            bpy.app.timers.unregister(_t)
     if _on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load)
     if _on_depsgraph in bpy.app.handlers.depsgraph_update_post:

@@ -103,6 +103,84 @@ def _rgb_hue_to_ryb(deg):
     return d
 
 
+# ---- OKLab: perceptual blending. Interpolating brand colours in linear
+# ---- RGB drags mid-stops toward grey; OKLab keeps them on-hue.
+
+
+def gen_palette(seed, harmony, sat, bright, stops):
+    """Deterministic palette from a seed, laid out along a harmony wheel.
+
+    Hues are sorted before use: adjacent ramp stops that jump far around the
+    wheel interpolate through grey, which kills the gradient.
+    """
+    rng = random.Random(seed)
+    base = rng.random()
+    offs = HARMONY_OFFSETS.get(harmony, HARMONY_OFFSETS['ANALOGOUS'])
+    hues = [offs[i % len(offs)] for i in range(stops)]
+    hues.sort()
+    if rng.random() < 0.5:
+        hues.reverse()
+    hues = [(base + h) % 1.0 for h in hues]
+
+    cols = []
+    for i, h in enumerate(hues):
+        t = i / max(1, stops - 1)
+        v = 0.35 + 0.65 * t
+        s = 1.0 - 0.35 * t
+        if harmony == 'MONOCHROME':
+            s = 1.0 - 0.75 * t
+        v = max(0.0, min(1.0, v * bright))
+        s = max(0.0, min(1.0, s * sat))
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        cols.append((r, g, b, 1.0))
+    return cols
+
+
+# ---- OKLab: perceptual blending. Interpolating brand colours in linear RGB
+# ---- drags mid-stops toward grey; OKLab keeps them saturated and on-hue.
+
+
+def _srgb_to_oklab(c):
+    r, g, b = c[0], c[1], c[2]
+    l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+    m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+    s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+    l_, m_, s_ = np.cbrt(l), np.cbrt(m), np.cbrt(s)
+    return (0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+            1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+            0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_)
+
+
+def _oklab_to_srgb(lab):
+    L, a, b = lab
+    l_ = L + 0.3963377774 * a + 0.2158037573 * b
+    m_ = L - 0.1055613458 * a - 0.0638541728 * b
+    s_ = L - 0.0894841775 * a - 1.2914855480 * b
+    l, m, s = l_ ** 3, m_ ** 3, s_ ** 3
+    return (max(0.0, 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+            max(0.0, -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+            max(0.0, -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s))
+
+
+def brand_palette(colors, stops, lift=0.0):
+    """Blend the brand colours through OKLab into `stops` ramp entries."""
+    labs = [_srgb_to_oklab(c) for c in colors]
+    if len(labs) == 1:
+        labs = labs * 2
+    out = []
+    segs = len(labs) - 1
+    for i in range(stops):
+        t = i / max(1, stops - 1)
+        pos = t * segs
+        j = min(int(pos), segs - 1)
+        f = pos - j
+        lab = tuple(labs[j][k] * (1 - f) + labs[j + 1][k] * f for k in range(3))
+        if lift:
+            lab = (min(1.0, max(0.0, lab[0] + lift * (t - 0.5) * 2.0)), lab[1], lab[2])
+        out.append(tuple(_oklab_to_srgb(lab)) + (1.0,))
+    return out
+
+
 def _oklch(c):
     L, a, b = _srgb_to_oklab(c)
     return L, math.hypot(a, b), math.atan2(b, a)
@@ -342,6 +420,43 @@ def build_material():
     return mat
 
 
+class viewport_paused:
+    """Stop the viewport evaluating while node trees and images are rebuilt.
+
+    Swapping materials, node links and image buffers underneath a viewport
+    that is actively shading them is what produced the tbbmalloc access
+    violations. Dropping to solid for the duration removes the reader.
+    """
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.saved = []
+
+    def __enter__(self):
+        try:
+            for win in self.ctx.window_manager.windows:
+                for area in win.screen.areas:
+                    if area.type != 'VIEW_3D':
+                        continue
+                    sh = area.spaces[0].shading
+                    self.saved.append((sh, sh.type, sh.use_compositor))
+                    sh.use_compositor = 'DISABLED'
+                    if sh.type in ('MATERIAL', 'RENDERED'):
+                        sh.type = 'SOLID'
+        except Exception:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        for sh, t, comp in self.saved:
+            try:
+                sh.type = t
+                sh.use_compositor = comp
+            except Exception:
+                pass
+        return False
+
+
 def build_stage(ctx):
     scene = ctx.scene
     plane = bpy.data.objects.get(PLANE_NAME)
@@ -479,11 +594,18 @@ def _pattern_image(name, arr):
     """
     h, w = arr.shape[0], arr.shape[1]
     img = bpy.data.images.get(name)
-    if img and (img.size[0] != w or img.size[1] != h):
+    if img is not None and len(img.pixels) != w * h * 4:
+        # Recreate on a size change. Image.scale() looked like the safer option
+        # - same datablock, no dangling pointers - but on generated float
+        # images it reports the new size while writes still hit the old buffer,
+        # so the resize silently breaks. Callers that rebuild patterns hold the
+        # viewport paused, and sync_fx re-points every node afterwards.
         bpy.data.images.remove(img)
         img = None
     if img is None:
         img = bpy.data.images.new(name, width=w, height=h, alpha=False, float_buffer=True)
+    if len(img.pixels) != w * h * 4:
+        return img          # refuse to write a buffer of the wrong shape
     img.colorspace_settings.name = 'Non-Color'
     # Fake user, or Blender purges the tile the moment a mode stops referencing
     # it - switching dither mode was quietly deleting the other pattern.
@@ -2463,11 +2585,15 @@ class WT_OT_setup(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, ctx):
-        build_stage(ctx)
-        r = ctx.scene.render
-        build_patterns(r.resolution_x, r.resolution_y)
-        build_compositor(ctx.scene)
-        sync_all(ctx)
+        # Everything below swaps materials, node links and image buffers. Doing
+        # that while a viewport is shading them corrupts the heap, so the
+        # viewport is dropped to solid for the duration and restored after.
+        with viewport_paused(ctx):
+            build_stage(ctx)
+            r = ctx.scene.render
+            build_patterns(r.resolution_x, r.resolution_y)
+            build_compositor(ctx.scene)
+            sync_all(ctx)
         for area in ctx.screen.areas:
             if area.type == 'VIEW_3D':
                 for sp in area.spaces:
@@ -3339,15 +3465,16 @@ class WT_OT_iri_build(bpy.types.Operator):
                       "LUT and build the iridescent material")
 
     def execute(self, ctx):
-        build_stage(ctx)
-        bake_lut(ctx.scene, self.report)
-        bake_simulation(ctx.scene, self.report)
-        build_iridescent_material(ctx.scene)
-        ctx.scene.wavetex.pipeline = 'IRIDESCENT'
-        assign_pipeline(ctx)
-        sync_iri(ctx)
-        sync_fx(ctx)
-        return {'FINISHED'}
+        with viewport_paused(ctx):
+            build_stage(ctx)
+            bake_lut(ctx.scene, self.report)
+            bake_simulation(ctx.scene, self.report)
+            build_iridescent_material(ctx.scene)
+            ctx.scene.wavetex.pipeline = 'IRIDESCENT'
+            assign_pipeline(ctx)
+            sync_iri(ctx)
+            sync_fx(ctx)
+            return {'FINISHED'}
 
 
 class WT_OT_iri_bake_sim(bpy.types.Operator):
@@ -3455,7 +3582,8 @@ class WT_OT_rebuild_patterns(bpy.types.Operator):
     def execute(self, ctx):
         r = ctx.scene.render
         r.resolution_percentage = 100
-        sync_fx(ctx)     # u_fx_scrim rebuilds every pattern at the right size
+        with viewport_paused(ctx):
+            sync_fx(ctx)   # u_fx_scrim rebuilds every pattern at the right size
         self.report({'INFO'}, "Patterns rebuilt at %dx%d" % (r.resolution_x, r.resolution_y))
         return {'FINISHED'}
 
@@ -3770,14 +3898,13 @@ class WT_PT_mypresets(Base, bpy.types.Panel):
     bl_parent_id = "WT_PT_library"
     bl_label = "My Presets"
 
-    _seeded = False
-
     def draw(self, ctx):
         sc = ctx.scene
         lay = self.layout
-        if not WT_PT_mypresets._seeded:
-            WT_PT_mypresets._seeded = True
-            library_refresh(sc)        # first safe moment to touch bpy.data
+        # Nothing here may write to the scene. draw() runs inside Blender's
+        # draw context, where touching an ID datablock raises "Writing to ID
+        # classes in this context is not allowed" and can take the process
+        # down. The list is filled by a deferred timer and on file load.
         row = lay.row()
         row.template_list("WT_UL_library", "", sc, "wavetex_library",
                           sc, "wavetex_library_index", rows=4)
@@ -4397,6 +4524,22 @@ def _on_load(_dummy):
         print("[wave_texture_maker] restore skipped:", exc)
 
 
+def _deferred_library_refresh():
+    """Populate the preset list once, off the draw path.
+
+    register() cannot do it (bpy.data is restricted during add-on
+    registration) and draw() must not do it (writing to an ID there is
+    disallowed and unstable). A one-shot timer runs in a context where both
+    are fine.
+    """
+    try:
+        for sc in bpy.data.scenes:
+            library_refresh(sc)
+    except Exception as exc:
+        print("[wave_texture_maker] library refresh deferred:", exc)
+    return None            # returning None unregisters the timer
+
+
 def register():
     for c in CLASSES:
         bpy.utils.register_class(c)
@@ -4407,15 +4550,14 @@ def register():
         bpy.app.handlers.load_post.append(_on_load)
     if _on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph)
-    # bpy.data is restricted during register(), so populate the list lazily
-    try:
-        for sc in bpy.data.scenes:
-            library_refresh(sc)
-    except Exception:
-        pass
+    # bpy.data is restricted during register(), so defer the first fill
+    if not bpy.app.timers.is_registered(_deferred_library_refresh):
+        bpy.app.timers.register(_deferred_library_refresh, first_interval=0.2)
 
 
 def unregister():
+    if bpy.app.timers.is_registered(_deferred_library_refresh):
+        bpy.app.timers.unregister(_deferred_library_refresh)
     if _on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load)
     if _on_depsgraph in bpy.app.handlers.depsgraph_update_post:

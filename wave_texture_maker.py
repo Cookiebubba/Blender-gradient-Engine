@@ -1404,8 +1404,9 @@ def u_fx_lens(self, ctx):
     n = cnodes()
     if not n:
         return
-    n['FX_Lens'].inputs['Dispersion'].default_value = self.chromatic
-    n['FX_Lens'].inputs['Distortion'].default_value = self.lens_distort
+    on = self.use_lens
+    n['FX_Lens'].inputs['Dispersion'].default_value = self.chromatic if on else 0.0
+    n['FX_Lens'].inputs['Distortion'].default_value = self.lens_distort if on else 0.0
 
 
 def _short_edge(ctx):
@@ -1419,15 +1420,16 @@ def u_fx_blur(self, ctx):
         return
     # Size is in pixels, so a percent-of-image slider has to be resolved against
     # the current output resolution (and re-resolved when it changes).
-    px = self.blur_amount / 100.0 * _short_edge(ctx)
+    amt = self.blur_amount if self.use_blur else 0.0
+    px = amt / 100.0 * _short_edge(ctx)
     b = n['FX_Blur']
     b.inputs['Size'].default_value = (px, px)
     b.mute = px <= 0.0
     k = n['FX_Painterly']
-    k.mute = self.painterly <= 0.0
+    k.mute = (not self.use_blur) or self.painterly <= 0.0
     k.inputs['Size'].default_value = max(1.0, self.painterly)
     px = n['FX_Pixelate']
-    px.mute = self.pixelate <= 1
+    px.mute = (not self.use_blur) or self.pixelate <= 1
     px.inputs['Size'].default_value = int(max(1, self.pixelate))
 
 
@@ -1436,9 +1438,12 @@ def u_fx_bloom(self, ctx):
     if not n:
         return
     g = n['FX_Bloom']
-    g.inputs['Strength'].default_value = self.bloom
+    g.mute = (not self.use_bloom) or self.bloom <= 0.0
+    g.inputs['Strength'].default_value = self.bloom if self.use_bloom else 0.0
     g.inputs['Threshold'].default_value = self.bloom_threshold
     g.inputs['Size'].default_value = self.bloom_size
+    # the socket alone does not drive BLOOM in 4.5 - the legacy int still rules
+    g.size = int(self.bloom_size)
 
 
 def u_fx_dither(self, ctx):
@@ -1446,12 +1451,12 @@ def u_fx_dither(self, ctx):
     if not n:
         return
     post = n['FX_Posterize']
-    post.mute = self.posterize_steps <= 0
+    post.mute = (not self.use_dither) or self.posterize_steps <= 0
     steps = max(2, self.posterize_steps)
     post.inputs['Steps'].default_value = float(steps)
 
     dp = n['DitherPattern']
-    if self.dither_mode == 'NONE':
+    if self.dither_mode == 'NONE' or not self.use_dither:
         n['DitherAdd'].inputs['Fac'].default_value = 0.0
         return
     dp.image = bpy.data.images.get(
@@ -1483,7 +1488,7 @@ def u_fx_grain(self, ctx):
     n = cnodes()
     if not n:
         return
-    n['GrainAdd'].inputs['Fac'].default_value = self.grain
+    n['GrainAdd'].inputs['Fac'].default_value = self.grain if self.use_grain else 0.0
     # Blend the density curve toward flat as rolloff drops. 1.0 is the film
     # curve (quiet shadows and highlights, peak in the midtones); 0.0 is
     # uniform digital noise everywhere.
@@ -1550,7 +1555,7 @@ def u_fx_vignette(self, ctx):
     n = cnodes()
     if not n:
         return
-    n['VignetteMul'].inputs['Fac'].default_value = self.vignette
+    n['VignetteMul'].inputs['Fac'].default_value = self.vignette if self.use_vignette else 0.0
     n['VignetteMask'].inputs['Size'].default_value = (self.vignette_size, self.vignette_size)
     px = max(1.0, self.vignette_softness / 100.0 * _short_edge(ctx))
     n['VignetteBlur'].inputs['Size'].default_value = (px, px)
@@ -1573,6 +1578,8 @@ def u_fx_tone(self, ctx):
     scale = n['ToneScale']
     scale.inputs[2].default_value = (span, span, span, 1.0)
     scale.mute = off
+    if not self.use_tone:
+        lo, hi = 0.0, 1.0
     t = n['FX_ToneRange']
     t.inputs[2].default_value = (lo, lo, lo, 1.0)
     t.mute = off
@@ -1591,10 +1598,13 @@ def u_fx_scrim(self, ctx):
     if not n:
         return
     n['ScrimImage'].image = bpy.data.images.get("WT_Scrim")
-    n['ScrimStrength'].inputs[1].default_value = self.scrim_strength
+    n['ScrimStrength'].inputs[1].default_value = self.scrim_strength if self.use_scrim else 0.0
     n['ScrimColor'].outputs[0].default_value = tuple(self.scrim_color) + (1.0,)
     n['EdgeImage'].image = bpy.data.images.get("WT_EdgeFade")
-    n['FX_EdgeAlpha'].mute = not self.edge_fade
+    # Edge fade writes ALPHA. With an opaque film the alpha is discarded on
+    # save, so the control looks dead - gate it on transparency and surface
+    # that dependency in the panel rather than failing silently.
+    n['FX_EdgeAlpha'].mute = not (self.edge_fade and self.transparent_bg)
 
 
 def u_viewport_fx(self, ctx):
@@ -1607,6 +1617,10 @@ def u_viewport_fx(self, ctx):
 
 def u_transparent(self, ctx):
     ctx.scene.render.film_transparent = self.transparent_bg
+    # An RGB output silently discards alpha, which makes both the transparent
+    # film and the edge fade look broken - they were working, the save was
+    # throwing the channel away.
+    ctx.scene.render.image_settings.color_mode = 'RGBA' if self.transparent_bg else 'RGB'
 
 
 # ------------------------------------------------ pipeline B callbacks -----
@@ -2020,8 +2034,16 @@ class WaveTexProps(bpy.types.PropertyGroup):
     iri_flat: bpy.props.BoolProperty(name="Flat / Unlit", default=True, update=u_iri_surface)
 
     # ---- global post effects (compositor) ----
+    use_blur: bpy.props.BoolProperty(name="Enable Blur", default=True, update=u_fx_blur)
+    use_bloom: bpy.props.BoolProperty(name="Enable Bloom", default=True, update=u_fx_bloom)
+    use_dither: bpy.props.BoolProperty(name="Enable Dither", default=True, update=u_fx_dither)
+    use_grain: bpy.props.BoolProperty(name="Enable Grain", default=True, update=u_fx_grain)
+    use_lens: bpy.props.BoolProperty(name="Enable Lens", default=True, update=u_fx_lens)
+    use_vignette: bpy.props.BoolProperty(name="Enable Vignette", default=True, update=u_fx_vignette)
+    use_scrim: bpy.props.BoolProperty(name="Enable Scrim", default=True, update=u_fx_scrim)
+    use_tone: bpy.props.BoolProperty(name="Enable Tone Range", default=True, update=u_fx_tone)
     blur_amount: bpy.props.FloatProperty(
-        name="Blur", default=0.0, min=0.0, max=40.0, update=u_fx_blur,
+        name="Blur", default=0.0, min=0.0, max=100.0, update=u_fx_blur,
         description="Percent-of-image gaussian blur. Large values turn the wave into a soft mesh gradient")
     painterly: bpy.props.FloatProperty(
         name="Painterly", default=0.0, min=0.0, max=30.0, update=u_fx_blur,
@@ -2031,7 +2053,7 @@ class WaveTexProps(bpy.types.PropertyGroup):
         description="Chunky pixel blocks. 1 disables it")
 
     bloom: bpy.props.FloatProperty(name="Bloom", default=0.0, min=0.0, max=1.0, update=u_fx_bloom)
-    bloom_threshold: bpy.props.FloatProperty(name="Bloom Threshold", default=0.8, min=0.0, max=2.0,
+    bloom_threshold: bpy.props.FloatProperty(name="Bloom Threshold", default=0.45, min=0.0, max=2.0,
                                              update=u_fx_bloom)
     bloom_size: bpy.props.FloatProperty(name="Bloom Size", default=7.0, min=1.0, max=9.0, update=u_fx_bloom)
 
@@ -3769,8 +3791,12 @@ class WT_PT_fx_dither(Base, bpy.types.Panel):
     bl_parent_id = "WT_PT_fx"
     bl_label = "Dither & Posterize"
 
+    def draw_header(self, ctx):
+        self.layout.prop(ctx.scene.wavetex, "use_dither", text="")
+
     def draw(self, ctx):
         p = ctx.scene.wavetex
+        self.layout.active = p.use_dither
         lay = self.layout
         lay.prop(p, "posterize_steps")
         lay.prop(p, "dither_mode", text="")
@@ -3785,8 +3811,12 @@ class WT_PT_fx_blur(Base, bpy.types.Panel):
     bl_parent_id = "WT_PT_fx"
     bl_label = "Blur & Bloom"
 
+    def draw_header(self, ctx):
+        self.layout.prop(ctx.scene.wavetex, "use_blur", text="")
+
     def draw(self, ctx):
         p = ctx.scene.wavetex
+        self.layout.active = p.use_blur
         c = self.layout.column(align=True)
         c.prop(p, "blur_amount")
         c.prop(p, "painterly")
@@ -3803,15 +3833,23 @@ class WT_PT_fx_lens(Base, bpy.types.Panel):
     bl_parent_id = "WT_PT_fx"
     bl_label = "Lens, Grain & Vignette"
 
+    def draw_header(self, ctx):
+        self.layout.prop(ctx.scene.wavetex, "use_lens", text="")
+
     def draw(self, ctx):
         p = ctx.scene.wavetex
+        self.layout.active = p.use_lens
         lay = self.layout
         c = lay.column(align=True)
         c.prop(p, "chromatic")
         c.prop(p, "lens_distort")
         c2 = lay.column(align=True)
         c2.label(text="Film grain has its own panel below")
+        r = lay.row(align=True)
+        r.prop(p, "use_vignette", text="")
+        r.label(text="Vignette")
         c3 = lay.column(align=True)
+        c3.active = p.use_vignette
         c3.prop(p, "vignette")
         sub = c3.column(align=True)
         sub.enabled = p.vignette > 0.0
@@ -3824,8 +3862,12 @@ class WT_PT_grain(Base, bpy.types.Panel):
     bl_parent_id = "WT_PT_fx"
     bl_label = "Film Grain"
 
+    def draw_header(self, ctx):
+        self.layout.prop(ctx.scene.wavetex, "use_grain", text="")
+
     def draw(self, ctx):
         p = ctx.scene.wavetex
+        self.layout.active = p.use_grain
         lay = self.layout
         col = lay.column(align=True)
         for key, label, _ in FILM_STOCKS:
@@ -3851,10 +3893,19 @@ class WT_PT_legibility(Base, bpy.types.Panel):
         p = ctx.scene.wavetex
         lay = self.layout
         c = lay.column(align=True)
+        r = lay.row(align=True)
+        r.prop(p, "use_tone", text="")
+        r.label(text="Tone Range")
+        c.active = p.use_tone
         c.prop(p, "tone_floor")
         c.prop(p, "tone_ceiling")
         lay.separator()
-        lay.prop(p, "scrim_strength")
+        r = lay.row(align=True)
+        r.prop(p, "use_scrim", text="")
+        r.label(text="Scrim")
+        sc_col = lay.column(align=True)
+        sc_col.active = p.use_scrim
+        sc_col.prop(p, "scrim_strength")
         box = lay.column(align=True)
         box.enabled = p.scrim_strength > 0.0
         box.prop(p, "scrim_dir", text="")
@@ -3863,6 +3914,8 @@ class WT_PT_legibility(Base, bpy.types.Panel):
         box.prop(p, "scrim_softness")
         lay.separator()
         lay.prop(p, "edge_fade")
+        if p.edge_fade and not p.transparent_bg:
+            lay.label(text="Edge fade needs Transparent Background", icon='ERROR')
         e = lay.column(align=True)
         e.enabled = p.edge_fade
         e.prop(p, "edge_inset")

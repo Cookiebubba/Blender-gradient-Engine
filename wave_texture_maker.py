@@ -1739,6 +1739,14 @@ def u_aura(self, ctx):
             _MUTE = prev
         u_colors(self, ctx)
 
+    if self.aura_steps > 1 and n['FieldEqualise'].color_ramp.elements.__len__() < 4:
+        # Without a balanced histogram the outer zones get almost no area and
+        # palette colours vanish. Do it automatically the first time zones are
+        # switched on rather than leaving a silent trap.
+        try:
+            bpy.ops.wavetex.balance_zones()
+        except Exception:
+            pass
     if self.aura_steps > 1:
         steps.interpolation_type = 'STEPPED'
         steps.inputs['Steps'].default_value = float(self.aura_steps - 1)
@@ -3776,6 +3784,14 @@ class WT_PT_fx(Base, bpy.types.Panel):
     def draw(self, ctx):
         p = ctx.scene.wavetex
         lay = self.layout
+        # Everything in this panel is compositor-side, so with the live preview
+        # off none of it shows in the viewport - it is all still in the render.
+        # Without this note that reads as "the effects are broken".
+        if p.viewport_fx == 'DISABLED':
+            box = lay.box()
+            box.label(text="Effects below are not previewed", icon='INFO')
+            box.label(text="in the viewport. They ARE rendered.")
+            box.label(text="Turn Live Preview on to see them.")
         lay.prop(p, "viewport_fx", text="Live Preview")
         g = lay.grid_flow(columns=2, even_columns=True)
         for key, label, icon in [('CLEAN', "Clean", 'SHADING_SOLID'),
@@ -3819,6 +3835,11 @@ class WT_PT_fx_blur(Base, bpy.types.Panel):
         self.layout.active = p.use_blur
         c = self.layout.column(align=True)
         c.prop(p, "blur_amount")
+        if p.blur_amount > 0.5 and (p.grain > 0.02 or p.dither_amount > 0.5):
+            note = self.layout.box()
+            note.label(text="Grain and dither are added AFTER", icon='INFO')
+            note.label(text="blur, so texture remains. Blur acts")
+            note.label(text="on colour edges, not on grain.")
         c.prop(p, "painterly")
         c.prop(p, "pixelate")
         c2 = self.layout.column(align=True)

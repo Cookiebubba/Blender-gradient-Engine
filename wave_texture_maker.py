@@ -325,6 +325,84 @@ def _bayer(n=8):
     return m / m.size
 
 
+def _blue_noise(rng, h, w):
+    """Uniform 0..1 noise with its low frequencies removed.
+
+    White noise dithers badly because its energy sits everywhere, including the
+    low frequencies the eye is most sensitive to - that is what reads as dirty
+    static. Blue noise pushes energy into the high frequencies, so the pattern
+    disappears into texture instead of announcing itself. Built by high-passing
+    white noise, then rank-transforming back to a flat distribution, because a
+    dither threshold is only correct if its values are uniform.
+    """
+    n = rng.random((h, w))
+    ky = np.fft.fftfreq(h)[:, None]
+    kx = np.fft.fftfreq(w)[None, :]
+    r = np.hypot(kx, ky)
+    b = np.real(np.fft.ifft2(np.fft.fft2(n) * (r / (r.max() + 1e-12)) ** 3.0))
+    ranks = b.ravel().argsort().argsort().reshape(h, w)
+    return (ranks + 0.5) / float(h * w)
+
+
+# Screen angles from four-colour print. Offsetting each channel keeps the dots
+# from stacking into a moire and is what gives real halftones their colour life.
+_SCREEN_ANGLES = (15.0, 75.0, 0.0)
+
+
+def build_dither(w, h, mode='ORDERED', cell=1.0, order=8, angle=0.0,
+                 rgb_split=0.0, seed=1):
+    """Signed (-0.5..0.5) dither threshold field, one plane per channel."""
+    if mode == 'NONE':
+        return np.zeros((h, w, 3), dtype=np.float32)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    cell = max(0.25, float(cell))
+    # A cosine screen with a one-pixel period samples the same phase at every
+    # pixel and collapses to a constant. Periodic modes therefore need at least
+    # a two-pixel cell to exist at all.
+    if mode in {'HALFTONE', 'LINES', 'CROSS'}:
+        cell = max(2.0, cell)
+    rng = np.random.default_rng(seed)
+    order = int(max(2, 2 ** int(round(math.log(max(2, order), 2)))))
+
+    shared_noise = None
+    if mode in {'NOISE', 'BLUE'} and rgb_split <= 0.0:
+        shared_noise = (_blue_noise(rng, h, w) if mode == 'BLUE'
+                        else rng.random((h, w)))
+
+    out = np.empty((h, w, 3), dtype=np.float32)
+    for c in range(3):
+        a = math.radians(angle + _SCREEN_ANGLES[c] * rgb_split)
+        ca, sa = math.cos(a), math.sin(a)
+        X = (xx * ca + yy * sa) / cell
+        Y = (-xx * sa + yy * ca) / cell
+        if mode == 'ORDERED':
+            m = _bayer(order)
+            t = m[np.mod(Y.astype(np.int64), order),
+                  np.mod(X.astype(np.int64), order)]
+        elif mode == 'HALFTONE':
+            # clustered dot - grows from the centre of each cell like ink
+            t = 0.5 + 0.5 * np.cos(2 * np.pi * X) * np.cos(2 * np.pi * Y)
+        elif mode == 'LINES':
+            t = 0.5 + 0.5 * np.cos(2 * np.pi * X)
+        elif mode == 'CROSS':
+            t = 0.5 + 0.25 * (np.cos(2 * np.pi * X) + np.cos(2 * np.pi * Y))
+        else:                                   # NOISE / BLUE
+            if shared_noise is not None:
+                t = shared_noise
+            else:
+                t = (_blue_noise(rng, h, w) if mode == 'BLUE'
+                     else rng.random((h, w)))
+            if cell > 1.0:                      # chunky pixel dither
+                gh, gw = max(2, int(h / cell)), max(2, int(w / cell))
+                small = (_blue_noise(rng, gh, gw) if mode == 'BLUE'
+                         else rng.random((gh, gw)))
+                yi = np.minimum((np.arange(h) * gh) // h, gh - 1)
+                xi = np.minimum((np.arange(w) * gw) // w, gw - 1)
+                t = small[yi][:, xi]
+        out[:, :, c] = t - 0.5
+    return out
+
+
 def _pattern_image(name, arr):
     """Store a signed (-0.5..0.5) pattern in a float, non-color image.
 
@@ -448,14 +526,12 @@ def build_edge_fade(w, h, inset, softness):
     return _smoothstep((d - inset) / max(1e-3, softness)).astype(np.float32)
 
 
-def build_patterns(w, h, seed=1, scrim=None, edge=None, grain=None):
+def build_patterns(w, h, seed=1, scrim=None, edge=None, grain=None, dither=None):
     """Dither/grain patterns must be pixel-exact with the render, so they are
     rebuilt whenever the output resolution changes."""
-    b = _bayer(8)
-    tiled = np.tile(b, (h // 8 + 1, w // 8 + 1))[:h, :w]
-    _pattern_image("WT_DitherBayer", (tiled - 0.5).astype(np.float32))
     rng = np.random.default_rng(seed)
-    _pattern_image("WT_DitherNoise", (rng.random((h, w)) - 0.5).astype(np.float32))
+    dk = dither or {}
+    _pattern_image("WT_Dither", build_dither(w, h, seed=seed, **dk))
     gk = grain or {}
     _pattern_image("WT_Grain", build_grain(w, h, seed=seed, **gk))
     if scrim is not None:
@@ -515,7 +591,7 @@ def build_compositor(scene):
     # dither: add a signed pattern, then quantise. Order matters - the pattern
     # has to be added *before* the posterize or it does nothing.
     dimg = nd('CompositorNodeImage', 'DitherPattern', -500, -420)
-    dimg.image = bpy.data.images.get("WT_DitherBayer")
+    dimg.image = bpy.data.images.get("WT_Dither")
     dadd = nd('CompositorNodeMixRGB', 'DitherAdd', -280, 0)
     dadd.blend_type = 'ADD'
     dadd.inputs['Fac'].default_value = 0.0
@@ -1446,6 +1522,18 @@ def u_fx_bloom(self, ctx):
     g.size = int(self.bloom_size)
 
 
+def u_dither_build(self, ctx):
+    """Pattern geometry changed, so the tile has to be regenerated."""
+    r = ctx.scene.render
+    if r.resolution_x < 4 or r.resolution_y < 4:
+        return
+    _pattern_image("WT_Dither", build_dither(
+        r.resolution_x, r.resolution_y, mode=self.dither_mode, cell=self.dither_cell,
+        order=self.dither_order, angle=self.dither_angle,
+        rgb_split=self.dither_rgb_split, seed=self.seed))
+    u_fx_dither(self, ctx)
+
+
 def u_fx_dither(self, ctx):
     n = cnodes()
     if not n:
@@ -1459,16 +1547,17 @@ def u_fx_dither(self, ctx):
     if self.dither_mode == 'NONE' or not self.use_dither:
         n['DitherAdd'].inputs['Fac'].default_value = 0.0
         return
-    dp.image = bpy.data.images.get(
-        "WT_DitherBayer" if self.dither_mode == 'ORDERED' else "WT_DitherNoise")
+    dp.image = bpy.data.images.get("WT_Dither")
     # amplitude of one quantisation step, so the dither exactly spans a band
     if self.posterize_steps > 0:
         fac = self.dither_amount * 2.0 / steps
     else:
         # Anti-banding only. Measured on real sites this sits near 0.8% sigma;
-        # the pattern is +/-0.5 so 0.012 lands there at amount 1.0. Anything
-        # stronger reads as noise once sRGB expands the shadows.
-        fac = self.dither_amount * 0.012
+        # the pattern is +/-0.5 so 0.012 lands there at amount 1.0. But once the
+        # cell is large enough to see, the pattern is the point rather than a
+        # correction, so let it scale up with the cell.
+        vis = min(1.0, max(0.0, (self.dither_cell - 1.5) / 6.0))
+        fac = self.dither_amount * (0.012 * (1.0 - vis) + 0.22 * vis)
     n['DitherAdd'].inputs['Fac'].default_value = fac
 
 
@@ -1593,7 +1682,10 @@ def u_fx_scrim(self, ctx):
                    scrim=(self.scrim_dir, self.scrim_coverage, self.scrim_softness),
                    edge=(self.edge_inset, self.edge_softness),
                    grain=dict(size=self.grain_size, roughness=self.grain_roughness,
-                              scale=self.grain_scale, chroma=self.grain_chroma))
+                              scale=self.grain_scale, chroma=self.grain_chroma),
+                   dither=dict(mode=self.dither_mode, cell=self.dither_cell,
+                               order=self.dither_order, angle=self.dither_angle,
+                               rgb_split=self.dither_rgb_split))
     n = cnodes()
     if not n:
         return
@@ -2069,13 +2161,35 @@ class WaveTexProps(bpy.types.PropertyGroup):
         name="Posterize Steps", default=0, min=0, max=64, update=u_fx_dither,
         description="Quantise colors to N steps. 0 disables it")
     dither_mode: bpy.props.EnumProperty(
-        name="Dither", default='ORDERED', update=u_fx_dither,
+        name="Pattern", default='BLUE', update=u_dither_build,
         items=[('NONE', "Off", ""),
-               ('ORDERED', "Ordered (Bayer)", "Crosshatch pattern - the classic retro dither"),
-               ('NOISE', "Noise", "Random dither - smoother, more filmic")])
+               ('BLUE', "Blue Noise", "Low frequencies removed, so the pattern reads as "
+                                      "texture rather than dirt. The best default"),
+               ('NOISE', "White Noise", "Plain random - grittier, energy at every frequency"),
+               ('ORDERED', "Ordered (Bayer)", "Crosshatch grid - the classic retro dither"),
+               ('HALFTONE', "Halftone Dots", "Clustered dots that grow from each cell, like print"),
+               ('LINES', "Line Screen", "Parallel line screen - engraving and risograph"),
+               ('CROSS', "Crosshatch", "Two crossed line screens")])
     dither_amount: bpy.props.FloatProperty(
-        name="Dither Amount", default=1.0, min=0.0, max=2.0, update=u_fx_dither,
-        description="1.0 spans exactly one posterize step, which is what removes banding")
+        name="Amount", default=1.0, min=0.0, max=4.0, update=u_fx_dither,
+        description="1.0 spans exactly one posterize step, which is what removes banding. "
+                    "Push higher to make the pattern part of the look")
+    dither_cell: bpy.props.FloatProperty(
+        name="Cell Size", default=1.0, min=0.25, max=32.0, update=u_dither_build,
+        description="Pixels per dither cell. 1 is invisible anti-banding; 4-12 turns the "
+                    "pattern into visible texture - print, risograph, early web")
+    dither_order: bpy.props.IntProperty(
+        name="Matrix", default=8, min=2, max=32, update=u_dither_build,
+        description="Bayer matrix order - 2, 4, 8, 16. Small orders read as coarse "
+                    "crosshatch, large ones as fine grain. Ordered mode only")
+    dither_angle: bpy.props.FloatProperty(
+        name="Screen Angle", default=0.0, min=-90.0, max=90.0, update=u_dither_build,
+        description="Rotates the pattern off the pixel grid. Anything but 0 stops it "
+                    "aligning with the image and reading as a computer artefact")
+    dither_rgb_split: bpy.props.FloatProperty(
+        name="Colour Separation", default=0.0, min=0.0, max=1.0, update=u_dither_build,
+        description="Gives each channel its own screen angle, the way four-colour print "
+                    "does. Breaks up moire and adds colour life to the dots")
 
     grain: bpy.props.FloatProperty(
         name="Grain", default=0.0, min=0.0, max=1.0, update=u_fx_grain,
@@ -4037,7 +4151,9 @@ def _on_depsgraph(scene, _depsgraph=None):
                    scrim=(p.scrim_dir, p.scrim_coverage, p.scrim_softness),
                    edge=(p.edge_inset, p.edge_softness),
                    grain=dict(size=p.grain_size, roughness=p.grain_roughness,
-                              scale=p.grain_scale, chroma=p.grain_chroma))
+                              scale=p.grain_scale, chroma=p.grain_chroma),
+                   dither=dict(mode=p.dither_mode, cell=p.dither_cell, order=p.dither_order,
+                               angle=p.dither_angle, rgb_split=p.dither_rgb_split))
     sync_fx(bpy.context)
 
 

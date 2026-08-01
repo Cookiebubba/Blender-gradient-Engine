@@ -57,6 +57,33 @@ Grain is modelled rather than pasted on:
 
 Stocks: 35mm Fine / Standard / Pushed, 16mm, Super 8, B&W 400.
 
+## Dithering
+
+Six pattern types, each with cell size, screen angle and per-channel colour
+separation — the controls that decide whether a gradient reads as printed
+matter or as a computer artefact.
+
+| Mode | Character |
+|---|---|
+| Blue Noise | low frequencies removed, so it reads as texture not dirt — the default |
+| White Noise | plain random, grittier |
+| Ordered (Bayer) | crosshatch grid, selectable matrix order |
+| Halftone Dots | clustered dots growing from each cell, like print |
+| Line Screen | parallel lines — engraving, risograph |
+| Crosshatch | two crossed line screens |
+
+Two details that matter:
+
+- **Cell size** decides the whole register. At 1px it is invisible
+  anti-banding; at 4–12px the pattern becomes the look.
+- **Colour separation** gives each channel its own screen angle (15°/75°/0°,
+  as in four-colour print). This is what stops the dots stacking into a moire
+  and gives halftones their colour life.
+
+Periodic screens are clamped to a 2px minimum cell — a cosine screen with a
+one-pixel period samples the same phase at every pixel and collapses to a flat
+field.
+
 ## Design tools
 
 - **Palette** from a seed with colour-harmony rules, or from your own brand

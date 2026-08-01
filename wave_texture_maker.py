@@ -34,77 +34,145 @@ HARMONY_OFFSETS = {
     'MONOCHROME':    [0.0, 0.0, 0.0, 0.0, 0.0],
 }
 
+# ======================================================================
+#  COLOUR HARMONY ENGINE
+#
+#  Hue offsets in DEGREES from the base, in the order a palette should use
+#  them. These are the standard wheel relationships every colour tool ships.
+#  `spread` scales the offsets, so Analogous can be tightened or widened
+#  without leaving the rule.
+# ======================================================================
 
-def gen_palette(seed, harmony, sat, bright, stops):
-    """Deterministic palette from a seed, laid out along a harmony wheel.
+# Angles are degrees on the ARTIST (RYB) wheel unless the panel says otherwise.
+# The first eight mirror Adobe Color's current set, verified against the live
+# tool's DOM. Tetradic and Double Split are NOT in Adobe's tool any more - they
+# were dropped in the Express rebuild and survive mostly in stale blog posts -
+# but they are real classical harmonies that other pickers still ship, so they
+# stay here, listed after Adobe's.
+HARMONY_RULES = {
+    'MONO':        [0, 0, 0, 0, 0, 0],
+    'SHADES':      [0, 0, 0, 0, 0, 0],
+    'ANALOGOUS':   [0, 30, -30, 60, -60, 90],
+    'COMPLEMENT':  [0, 180, 30, 210, -30, 150],
+    'SPLIT':       [0, 150, 210, 30, 330, 180],
+    'TRIAD':       [0, 120, 240, 60, 180, 300],
+    'SQUARE':      [0, 90, 180, 270, 45, 225],
+    'COMPOUND':    [0, 30, 180, 210, -30, 150],
+    'TETRAD':      [0, 60, 180, 240, 120, 300],
+    'DOUBLESPLIT': [0, 30, -30, 150, 210, 180],
+}
 
-    Hues are sorted before use: adjacent ramp stops that jump far around the
-    wheel interpolate through grey, which kills the gradient.
+
+
+# ----------------------------------------------------------------- RYB ------
+#
+# Adobe Color does NOT rotate hue on the RGB wheel. Confirmed on the record by
+# Adobe staff: "Harmonies in Adobe Color are based in the RYB wheel." The
+# consequence designers actually feel is that red's complement comes out GREEN
+# (Adobe reports HSB 137) rather than the cyan an RGB wheel gives at 180.
+#
+# This table is the classic artist's-wheel mapping from RYB hue to RGB hue.
+# Sanity check: RYB 180 lands on RGB 138, within a degree of Adobe's 137.
+#
+# Worth being explicit about what RYB does and does not buy you. It fixes which
+# hues are opposites. It does nothing about yellow reading far lighter than
+# blue at the same saturation - that is a perceptual problem, and only a
+# perceptual space fixes it. The two goals are separate, so they are separate
+# options in the panel rather than one blended model.
+
+_RYB_TO_RGB_HUE = [0, 8, 17, 26, 34, 41, 48, 54, 60, 81, 103, 123, 138,
+                   155, 171, 187, 204, 219, 234, 251, 267, 282, 298, 329, 360]
+
+
+def _ryb_hue_to_rgb(deg):
+    d = deg % 360.0
+    i = int(d // 15.0)
+    f = (d - i * 15.0) / 15.0
+    a, b = _RYB_TO_RGB_HUE[i], _RYB_TO_RGB_HUE[i + 1]
+    return (a + (b - a) * f) % 360.0
+
+
+def _rgb_hue_to_ryb(deg):
+    d = deg % 360.0
+    tbl = _RYB_TO_RGB_HUE
+    for i in range(len(tbl) - 1):
+        a, b = tbl[i], tbl[i + 1]
+        if a <= d <= b:
+            f = 0.0 if b == a else (d - a) / (b - a)
+            return (i * 15.0 + f * 15.0) % 360.0
+    return d
+
+
+def _oklch(c):
+    L, a, b = _srgb_to_oklab(c)
+    return L, math.hypot(a, b), math.atan2(b, a)
+
+
+def _from_oklch(L, C, h):
+    return _oklab_to_srgb((L, C * math.cos(h), C * math.sin(h)))
+
+
+def _oklch_hue_of_rgb_hue(deg):
+    """OKLab hue angle for a given RGB-wheel hue.
+
+    The two wheels do not share an angle scale - OKLab's hue for pure red is
+    not 0 rad - so a degree figure from the RGB/RYB side has to be carried
+    across by round-tripping an actual colour rather than reused as radians.
     """
-    rng = random.Random(seed)
-    base = rng.random()
-    offs = HARMONY_OFFSETS.get(harmony, HARMONY_OFFSETS['ANALOGOUS'])
-    hues = [offs[i % len(offs)] for i in range(stops)]
-    hues.sort()
-    if rng.random() < 0.5:
-        hues.reverse()
-    hues = [(base + h) % 1.0 for h in hues]
-
-    cols = []
-    for i, h in enumerate(hues):
-        t = i / max(1, stops - 1)
-        v = 0.35 + 0.65 * t
-        s = 1.0 - 0.35 * t
-        if harmony == 'MONOCHROME':
-            s = 1.0 - 0.75 * t
-        v = max(0.0, min(1.0, v * bright))
-        s = max(0.0, min(1.0, s * sat))
-        r, g, b = colorsys.hsv_to_rgb(h, s, v)
-        cols.append((r, g, b, 1.0))
-    return cols
+    r, g, b = colorsys.hsv_to_rgb((deg % 360.0) / 360.0, 1.0, 1.0)
+    return _oklch((r, g, b))[2]
 
 
-# ---- OKLab: perceptual blending. Interpolating brand colours in linear RGB
-# ---- drags mid-stops toward grey; OKLab keeps them saturated and on-hue.
+def harmony_palette(base, mode, tones, sat=1.0, bright=1.0, spread=1.0,
+                    lift=0.55, wheel='ARTIST'):
+    """Derive a palette from one base colour by a wheel rule.
 
-def _srgb_to_oklab(c):
-    r, g, b = c[0], c[1], c[2]
-    l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
-    m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
-    s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
-    l_, m_, s_ = np.cbrt(l), np.cbrt(m), np.cbrt(s)
-    return (0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
-            1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
-            0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_)
+    `wheel` picks which problem you want solved:
+      ARTIST     - RYB angles (red's opposite is green) with OKLCH construction,
+                   so hue relationships match a designer's wheel AND every
+                   swatch carries equal perceived weight. The useful default.
+      ADOBE      - RYB angles with HSV construction. Reproduces what Adobe
+                   Color hands you, uneven lightness included.
+      PERCEPTUAL - RGB-wheel angles in OKLCH. Mathematically even, but red's
+                   opposite is cyan, which reads wrong to most designers.
+      DIGITAL    - plain HSV. What naive pickers do; kept for comparison.
+    """
+    offs = HARMONY_RULES.get(mode, HARMONY_RULES['ANALOGOUS'])
+    tones = max(2, int(tones))
+    L0, C0, h0 = _oklch(tuple(base))
+    C0 = max(C0, 0.02)                       # a dead-grey base has no hue to rotate
+    hsv0 = colorsys.rgb_to_hsv(*[min(1.0, max(0.0, v)) for v in tuple(base)[:3]])
 
-
-def _oklab_to_srgb(lab):
-    L, a, b = lab
-    l_ = L + 0.3963377774 * a + 0.2158037573 * b
-    m_ = L - 0.1055613458 * a - 0.0638541728 * b
-    s_ = L - 0.0894841775 * a - 1.2914855480 * b
-    l, m, s = l_ ** 3, m_ ** 3, s_ ** 3
-    return (max(0.0, 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
-            max(0.0, -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
-            max(0.0, -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s))
-
-
-def brand_palette(colors, stops, lift=0.0):
-    """Blend the brand colours through OKLab into `stops` ramp entries."""
-    labs = [_srgb_to_oklab(c) for c in colors]
-    if len(labs) == 1:
-        labs = labs * 2
     out = []
-    segs = len(labs) - 1
-    for i in range(stops):
-        t = i / max(1, stops - 1)
-        pos = t * segs
-        j = min(int(pos), segs - 1)
-        f = pos - j
-        lab = tuple(labs[j][k] * (1 - f) + labs[j + 1][k] * f for k in range(3))
-        if lift:
-            lab = (min(1.0, max(0.0, lab[0] + lift * (t - 0.5) * 2.0)), lab[1], lab[2])
-        out.append(tuple(_oklab_to_srgb(lab)) + (1.0,))
+    for i in range(tones):
+        t = i / float(tones - 1)
+        deg = offs[i % len(offs)] * spread
+        if mode == 'SHADES':
+            deg = 0.0
+
+        if wheel in ('ARTIST', 'ADOBE'):
+            # step on the artist's wheel, then come back to RGB hue
+            rgb_deg = _ryb_hue_to_rgb(_rgb_hue_to_ryb(hsv0[0] * 360.0) + deg)
+        else:
+            rgb_deg = (hsv0[0] * 360.0 + deg) % 360.0
+
+        L = L0 + (t - 0.5) * lift
+        C = C0
+        if mode in ('MONO', 'SHADES'):
+            C = C0 * (1.0 - 0.55 * t)
+        L = min(0.98, max(0.04, L * bright))
+        C = max(0.0, C * sat)
+
+        if wheel in ('ARTIST', 'PERCEPTUAL'):
+            r, g, b = _from_oklch(L, C, _oklch_hue_of_rgb_hue(rgb_deg))
+        else:
+            v = min(1.0, max(0.0, (0.35 + 0.65 * t) * bright))
+            sv = min(1.0, max(0.0, hsv0[1] * sat))
+            if mode in ('MONO', 'SHADES'):
+                sv *= (1.0 - 0.55 * t)
+            r, g, b = colorsys.hsv_to_rgb(rgb_deg / 360.0, sv, v)
+        out.append((min(1.0, max(0.0, r)), min(1.0, max(0.0, g)),
+                    min(1.0, max(0.0, b)), 1.0))
     return out
 
 
@@ -1366,8 +1434,19 @@ def u_colors(self, ctx):
             pal = adj
         apply_palette(pal)
     else:
-        apply_palette(gen_palette(self.seed, self.harmony, self.saturation,
-                                  self.brightness, self.color_stops))
+        pal = harmony_palette(self.harmony_base, self.harmony_mode, self.harmony_tones,
+                              sat=self.saturation, bright=self.brightness,
+                              spread=self.harmony_spread, lift=self.harmony_lift,
+                              wheel=self.harmony_wheel)
+        # the ramp wants `color_stops` entries; repeat the harmony round if the
+        # user asked for more stops than tones
+        if self.color_stops != len(pal):
+            pal = [pal[i % len(pal)] for i in range(self.color_stops)]
+        apply_palette(pal)
+        try:
+            wt_sync_preview_palette(ctx)
+        except Exception:
+            pass                      # swatch strip is cosmetic, never fatal
 
 
 def u_interp(self, ctx):
@@ -1948,6 +2027,48 @@ class WaveTexProps(bpy.types.PropertyGroup):
     stretch_x: bpy.props.FloatProperty(name="Stretch X", default=1.0, min=0.05, max=5.0, update=u_transform)
     stretch_y: bpy.props.FloatProperty(name="Stretch Y", default=1.0, min=0.05, max=5.0, update=u_transform)
 
+    harmony_base: bpy.props.FloatVectorProperty(
+        name="Base Colour", subtype='COLOR', size=3, default=(0.16, 0.28, 0.75),
+        min=0.0, max=1.0, update=u_colors,
+        description="Every other swatch is derived from this one by the wheel rule")
+    harmony_mode: bpy.props.EnumProperty(
+        name="Harmony", default='ANALOGOUS', update=u_colors,
+        items=[('MONO', "Monochromatic", "One hue, varying depth - the safest background"),
+               ('ANALOGOUS', "Analogous", "Neighbours on the wheel. Calm, cohesive, hard to get wrong"),
+               ('COMPLEMENT', "Complementary", "Opposite hues. Maximum contrast - use one as an accent"),
+               ('SPLIT', "Split Complementary", "The opposite hue's two neighbours. Contrast without the clash"),
+               ('TRIAD', "Triad", "Three evenly spaced hues. Vivid, needs one dominant"),
+               ('SQUARE', "Square", "Four evenly spaced hues"),
+               ('TETRAD', "Tetradic", "Two complementary pairs"),
+               ('COMPOUND', "Compound", "Analogous near the base, complementary accents"),
+               ('SHADES', "Shades", "One hue, lightness only - the calmest option of all"),
+               ('TETRAD', "Tetradic  (not in Adobe)", "Two complementary pairs"),
+               ('DOUBLESPLIT', "Double Split  (not in Adobe)",
+                "Both neighbours of base and opposite. Dropped from Adobe Color's "
+                "current tool, kept here because other pickers still ship it")])
+    harmony_tones: bpy.props.IntProperty(
+        name="Tones", default=3, min=2, max=6, update=u_colors,
+        description="2 gives a duotone, 3 the classic three-tone palette. More hues rarely helps")
+    harmony_spread: bpy.props.FloatProperty(
+        name="Spread", default=1.0, min=0.1, max=2.0, update=u_colors,
+        description="Scales the rule's hue angles. Below 1 tightens the palette, above widens it")
+    harmony_lift: bpy.props.FloatProperty(
+        name="Tonal Range", default=0.55, min=0.0, max=1.0, update=u_colors,
+        description="How far the palette travels from dark to light. 0 keeps every swatch "
+                    "at the base's depth, which reads flat as a gradient")
+    harmony_wheel: bpy.props.EnumProperty(
+        name="Wheel", default='ARTIST', update=u_colors,
+        items=[('ARTIST', "Artist  (recommended)",
+                "RYB angles so red's opposite is green, built in OKLCH so every swatch "
+                "reads at an even weight. Fixes both problems at once"),
+               ('ADOBE', "Adobe Color",
+                "RYB angles built in HSV - reproduces Adobe Color's output, uneven "
+                "lightness included"),
+               ('PERCEPTUAL', "Perceptual",
+                "RGB-wheel angles in OKLCH. Even lightness, but red's opposite is cyan, "
+                "which reads wrong to most designers"),
+               ('DIGITAL', "Digital (HSV)",
+                "Plain HSV rotation - what naive pickers do, kept for comparison")])
     palette_mode: bpy.props.EnumProperty(
         name="Palette", default='SEED', update=u_colors,
         items=[('SEED', "Generated", "Seed + colour harmony"),
@@ -2375,7 +2496,14 @@ class WT_OT_random_seed(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, ctx):
-        ctx.scene.wavetex.seed = random.randint(0, 99999)
+        p = ctx.scene.wavetex
+        p.seed = random.randint(0, 99999)
+        # a random base hue at a usable chroma and mid lightness - fully random
+        # RGB lands in muddy or near-black territory most of the time
+        rng = random.Random(p.seed)
+        r, g, b = _from_oklch(rng.uniform(0.45, 0.68), rng.uniform(0.09, 0.17),
+                              rng.uniform(0.0, TAU))
+        p.harmony_base = (min(1.0, r), min(1.0, g), min(1.0, b))
         return {'FINISHED'}
 
 
@@ -2393,14 +2521,65 @@ class WT_OT_seed_step(bpy.types.Operator):
 
 class WT_OT_cycle_harmony(bpy.types.Operator):
     bl_idname = "wavetex.cycle_harmony"
-    bl_label = "Next Harmony"
+    bl_label = "Step Harmony"
     bl_options = {'REGISTER', 'UNDO'}
+    delta: bpy.props.IntProperty(default=1)
 
     def execute(self, ctx):
         p = ctx.scene.wavetex
-        keys = [i[0] for i in p.bl_rna.properties['harmony'].enum_items]
-        p.harmony = keys[(keys.index(p.harmony) + 1) % len(keys)]
+        keys = [i[0] for i in p.bl_rna.properties['harmony_mode'].enum_items]
+        p.harmony_mode = keys[(keys.index(p.harmony_mode) + self.delta) % len(keys)]
         return {'FINISHED'}
+
+
+class WT_OT_harmony_from_ramp(bpy.types.Operator):
+    bl_idname = "wavetex.harmony_from_ramp"
+    bl_label = "Pick Base From Gradient"
+    bl_description = "Take the most saturated stop of the current gradient as the base colour"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, ctx):
+        mat = bpy.data.materials.get(MAT_NAME) or bpy.data.materials.get(AURA_MAT)
+        if not mat or 'GradientRamp' not in mat.node_tree.nodes:
+            return {'CANCELLED'}
+        best, bestc = None, -1.0
+        for e in mat.node_tree.nodes['GradientRamp'].color_ramp.elements:
+            c = tuple(e.color)[:3]
+            chroma = _oklch(c)[1]
+            if chroma > bestc:
+                best, bestc = c, chroma
+        if best:
+            ctx.scene.wavetex.harmony_base = best
+        return {'FINISHED'}
+
+
+PREVIEW_PALETTE = "WT_HarmonyPreview"
+
+
+def wt_sync_preview_palette(ctx):
+    """Rebuild the swatch datablock that the panel displays.
+
+    Called from the colour update callback, never from draw(). Creating or
+    mutating bpy.data inside a panel draw is undefined behaviour in Blender and
+    a known way to crash it - draw() only reads the result.
+    """
+    p = ctx.scene.wavetex
+    pal = bpy.data.palettes.get(PREVIEW_PALETTE)
+    if pal is None:
+        pal = bpy.data.palettes.new(PREVIEW_PALETTE)
+        pal.use_fake_user = True
+    cols = harmony_palette(p.harmony_base, p.harmony_mode, p.harmony_tones,
+                           sat=p.saturation, bright=p.brightness,
+                           spread=p.harmony_spread, lift=p.harmony_lift,
+                           wheel=p.harmony_wheel)
+    while len(pal.colors) > len(cols):
+        pal.colors.remove(pal.colors[-1])
+    while len(pal.colors) < len(cols):
+        pal.colors.new()
+    for slot, c in zip(pal.colors, cols):
+        if tuple(round(v, 4) for v in slot.color) != tuple(round(v, 4) for v in c[:3]):
+            slot.color = c[:3]
+    return pal
 
 
 class WT_OT_reverse_gradient(bpy.types.Operator):
@@ -3550,9 +3729,33 @@ class WT_PT_main(Base, bpy.types.Panel):
         r.operator("wavetex.sync", text="", icon='FILE_REFRESH')
 
 
+class WT_PT_presets_root(Base, bpy.types.Panel):
+    bl_idname = "WT_PT_presets_root"
+    bl_parent_id = "WT_PT_main"
+    bl_label = "Presets"
+
+    def draw(self, ctx):
+        pass
+
+
+class WT_PT_fx_presets(Base, bpy.types.Panel):
+    bl_parent_id = "WT_PT_presets_root"
+    bl_label = "Effect Presets"
+
+    def draw(self, ctx):
+        g = self.layout.grid_flow(columns=2, even_columns=True)
+        for key, label, icon in [('CLEAN', "Clean", 'SHADING_SOLID'),
+                                 ('SOFT', "Soft Gradient", 'MOD_SMOOTH'),
+                                 ('RETRO', "Retro Dither", 'IMAGE_ZDEPTH'),
+                                 ('FILMIC', "Filmic", 'CAMERA_DATA'),
+                                 ('PAINT', "Painterly", 'BRUSH_DATA'),
+                                 ('VHS', "VHS", 'SEQ_PREVIEW')]:
+            g.operator("wavetex.fx_preset", text=label, icon=icon).name_id = key
+
+
 class WT_PT_library(Base, bpy.types.Panel):
     bl_idname = "WT_PT_library"
-    bl_parent_id = "WT_PT_main"
+    bl_parent_id = "WT_PT_presets_root"
     bl_label = "Example Library"
 
     def draw(self, ctx):
@@ -3589,7 +3792,7 @@ class WT_PT_mypresets(Base, bpy.types.Panel):
 
 
 class WT_PT_presets(Pipe, Base, bpy.types.Panel):
-    bl_parent_id = "WT_PT_main"
+    bl_parent_id = "WT_PT_presets_root"
     bl_label = "Wave Presets"
     PIPES = {'WAVE'}
 
@@ -3684,14 +3887,29 @@ class WT_PT_color(Base, bpy.types.Panel):
                 r.prop(p, "brand_%d" % (i + 1), text="")
             lay.prop(p, "brand_lift")
         else:
-            row = lay.row(align=True)
-            row.operator("wavetex.seed_step", text="", icon='TRIA_LEFT').delta = -1
-            row.prop(p, "seed", text="Seed")
-            row.operator("wavetex.seed_step", text="", icon='TRIA_RIGHT').delta = 1
-            row.operator("wavetex.random_seed", text="", icon='FILE_REFRESH')
-            r2 = lay.row(align=True)
-            r2.prop(p, "harmony", text="")
-            r2.operator("wavetex.cycle_harmony", text="", icon='LOOP_FORWARDS')
+            # real colour wheel - pick the base by eye, everything else follows
+            box = lay.box()
+            box.label(text="Base Colour", icon='COLOR')
+            box.template_color_picker(p, "harmony_base", value_slider=True)
+            box.prop(p, "harmony_base", text="")
+            r = box.row(align=True)
+            r.operator("wavetex.random_seed", text="Random", icon='FILE_REFRESH')
+            r.operator("wavetex.harmony_from_ramp", text="Pick from Ramp", icon='EYEDROPPER')
+
+            hb = lay.box()
+            hb.prop(p, "harmony_mode", text="")
+            row = hb.row(align=True)
+            row.operator("wavetex.cycle_harmony", text="", icon='LOOP_BACK').delta = -1
+            row.prop(p, "harmony_tones")
+            row.operator("wavetex.cycle_harmony", text="", icon='LOOP_FORWARDS').delta = 1
+            # live swatch strip of what the rule produces
+            pal = bpy.data.palettes.get(PREVIEW_PALETTE)
+            if pal and len(pal.colors):
+                hb.template_palette(pal, "colors", color=True)
+            cc = hb.column(align=True)
+            cc.prop(p, "harmony_spread")
+            cc.prop(p, "harmony_lift")
+            hb.prop(p, "harmony_wheel", text="")
         c = lay.column(align=True)
         c.prop(p, "saturation")
         c.prop(p, "brightness")
@@ -3907,14 +4125,6 @@ class WT_PT_fx(Base, bpy.types.Panel):
             box.label(text="in the viewport. They ARE rendered.")
             box.label(text="Turn Live Preview on to see them.")
         lay.prop(p, "viewport_fx", text="Live Preview")
-        g = lay.grid_flow(columns=2, even_columns=True)
-        for key, label, icon in [('CLEAN', "Clean", 'SHADING_SOLID'),
-                                 ('SOFT', "Soft Gradient", 'MOD_SMOOTH'),
-                                 ('RETRO', "Retro Dither", 'IMAGE_ZDEPTH'),
-                                 ('FILMIC', "Filmic", 'CAMERA_DATA'),
-                                 ('PAINT', "Painterly", 'BRUSH_DATA'),
-                                 ('VHS', "VHS", 'SEQ_PREVIEW')]:
-            g.operator("wavetex.fx_preset", text=label, icon=icon).name_id = key
 
 
 class WT_PT_fx_dither(Base, bpy.types.Panel):
@@ -4109,7 +4319,7 @@ class WT_PT_export(Base, bpy.types.Panel):
 CLASSES = (
     WaveTexProps, WT_LibraryItem, WT_UL_library,
     WT_OT_example, WT_OT_lib_save, WT_OT_lib_apply, WT_OT_lib_delete, WT_OT_lib_refresh,
-    WT_OT_aura_seed_step, WT_OT_balance_zones, WT_OT_view_camera, WT_OT_film_stock,
+    WT_OT_aura_seed_step, WT_OT_balance_zones, WT_OT_harmony_from_ramp, WT_OT_view_camera, WT_OT_film_stock,
     WT_OT_check_contrast,
     WT_OT_setup, WT_OT_sync, WT_OT_random_seed, WT_OT_seed_step, WT_OT_cycle_harmony,
     WT_OT_reverse_gradient, WT_OT_random_filter, WT_OT_reset_filter, WT_OT_surprise,
@@ -4117,7 +4327,8 @@ CLASSES = (
     WT_OT_fx_preset, WT_OT_rebuild_patterns, WT_OT_set_size, WT_OT_export,
     WT_OT_iri_build, WT_OT_iri_bake_sim, WT_OT_iri_bake_lut, WT_OT_iri_preset, WT_OT_iri_random,
     WT_OT_poster, WT_OT_handoff,
-    WT_PT_main, WT_PT_library, WT_PT_mypresets, WT_PT_presets, WT_PT_aura, WT_PT_wave, WT_PT_transform, WT_PT_color,
+    WT_PT_main, WT_PT_presets_root, WT_PT_library, WT_PT_mypresets,
+    WT_PT_presets, WT_PT_fx_presets, WT_PT_aura, WT_PT_wave, WT_PT_transform, WT_PT_color,
     WT_PT_filter, WT_PT_noise, WT_PT_overlay, WT_PT_surface,
     WT_PT_iri, WT_PT_iri_film, WT_PT_iri_streak, WT_PT_iri_sim, WT_PT_iri_substrate,
     WT_PT_fx, WT_PT_fx_dither, WT_PT_fx_blur, WT_PT_fx_lens, WT_PT_grain,

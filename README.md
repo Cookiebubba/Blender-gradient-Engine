@@ -109,3 +109,9 @@ field.
 
 Rendered frames and baked simulation caches are gitignored — the add-on
 regenerates them.
+
+## Sample output
+
+![Aura Flow, pastel harmony, 35mm Standard grain](samples/aura-pastel-1920x1080.png)
+
+Aura Flow pipeline, three-tone harmony, 35mm Standard grain, 1920x1080.

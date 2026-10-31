@@ -1,5 +1,7 @@
 # Blender Gradient Engine
 
+<a href="https://buymeacoffee.com/brandynships"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="41"></a>
+
 A Blender add-on for generating **seamlessly looping animated gradient backgrounds**
 for websites — with a control panel in the 3D viewport, a preset library, film-grain
 emulation, and WCAG contrast checking.
